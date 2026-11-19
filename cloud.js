@@ -1,0 +1,38 @@
+/* Optional account sync; guest play remains local. No secret keys here. */
+(function(){
+'use strict';
+const cfg=window.MUNDO_AUTH_CONFIG||{}, configured=!!(cfg.url&&cfg.anonKey);
+let api,client,user=null,rev=null,busy=false,queued=null,timer=null,paused=false,status='Progresso local',dialog,account,epoch=0,activeUid=null;
+const $=id=>document.getElementById(id);
+const read=k=>{try{return JSON.parse(localStorage.getItem(k))}catch{return null}};
+const store=(k,x)=>{try{localStorage.setItem(k,JSON.stringify(x))}catch{}};
+const remove=k=>{try{localStorage.removeItem(k)}catch{}};
+const key=()=>api.guestKey+':account:'+user.id;
+function display(s){status=s;if(account){account.textContent=user?'Minha conta':'Entrar';account.title=s}const el=$('cloudStatus');if(el)el.textContent=s}
+function open(){dialog.showModal();draw()}
+function draw(){const pane=$('cloudContents');if(!pane)return;pane.replaceChildren();const add=(tag,txt)=>{let e=document.createElement(tag);e.textContent=txt;pane.append(e);return e};const btn=(title,fn)=>{let b=add('button',title);b.type='button';b.onclick=fn;return b};
+ add('h2',user?'Minha conta':'Continue de onde parou');add('p',status).id='cloudStatus';
+ if(!configured||!client){add('p','A sincronização online ainda não foi ativada. Você pode continuar jogando como visitante. Para trocar de navegador, exporte a partida em Configurações e importe no outro dispositivo.');btn('Continuar jogando',()=>dialog.close());return}
+ if(user){add('p',user.email||'Conta autenticada');btn('Sincronizar agora',()=>{const x=api.getState();if(api.validate(x)){queued=JSON.stringify(x);flush()}else display('Nenhuma partida iniciada.')});if(paused)btn('Recarregar progresso da nuvem',()=>{if(confirm('Substituir o progresso desta conta neste navegador pelo progresso da nuvem?'))loadUser(user,true)});btn('Sair da conta',signOut);btn('Apagar progresso online',reset);return}
+ add('p','Use uma conta para acessar o mesmo mandato em outro navegador. Nenhuma senha precisa ser digitada no jogo.');
+ if(cfg.google)btn('Continuar com Google',()=>oauth('google'));
+ if(cfg.apple)btn('Continuar com Apple',()=>oauth('apple'));
+ if(cfg.email){const input=add('input','');input.type='email';input.placeholder='Seu Gmail ou e-mail iCloud';input.autocomplete='email';btn('Enviar link de acesso',async()=>{if(!input.reportValidity()||!input.value.trim())return;try{const {error}=await client.auth.signInWithOtp({email:input.value.trim(),options:{emailRedirectTo:location.origin+'/'} });display(error?'Não foi possível enviar o link.':'Confira seu e-mail para entrar.')}catch{display('Falha de conexão.')}})}
+ btn('Jogar como visitante',()=>dialog.close());
+}
+async function oauth(provider){try{const {error}=await client.auth.signInWithOAuth({provider,options:{redirectTo:location.origin+'/'}});if(error)display('A autenticação ainda não está disponível.')}catch{display('Falha de conexão.')}}
+async function loadUser(next,force=false){if(!next)return;let run=++epoch;activeUid=next.id;paused=true;queued=null;rev=null;user=next;api.setKey(key());display('Carregando progresso online…');try{let {data,error}=await client.from('game_saves').select('state,revision').eq('user_id',next.id).maybeSingle();if(run!==epoch)return;if(error)throw error;let local=read(key());const guest=read(api.guestKey);let chosen=data?.state;
+ if(chosen&&!api.validate(chosen))throw Error('invalid remote');
+ if(data){rev=data.revision;if(!force&&api.validate(local)&&JSON.stringify(local)!==JSON.stringify(chosen)){store(key()+':backup',local)}}
+ else if(api.validate(local))chosen=local;
+ else if(api.validate(guest)&&confirm('Importar sua partida de visitante para esta conta? A partida local será preservada.'))chosen=guest;
+ paused=false;api.load(chosen||null);if(chosen){store(key(),chosen);if(!data){queued=JSON.stringify(chosen);await flush()}else display('Progresso sincronizado.')}else display('Conta conectada. Crie seu avatar.');if(dialog.open)draw()
+ }catch(e){if(run!==epoch)return;paused=true;display('Não foi possível carregar a nuvem. Nenhum progresso online foi substituído.');let local=read(key());api.load(api.validate(local)?local:null);if(dialog.open)draw()}}
+function notify(x){if(!user||paused||!api.validate(x))return;queued=JSON.stringify(x);clearTimeout(timer);timer=setTimeout(flush,1800)}
+async function flush(){if(busy||!user||paused||!queued)return;busy=true;let run=epoch,id=user.id,payload=queued;queued=null;try{let state=JSON.parse(payload);if(payload.length>900000)throw Error('saved game too large');let q=rev===null?client.from('game_saves').insert({user_id:id,state,revision:1}).select('revision').maybeSingle():client.from('game_saves').update({state,revision:rev+1,updated_at:new Date().toISOString()}).eq('user_id',id).eq('revision',rev).select('revision').maybeSingle();let {data,error}=await q;if(run!==epoch)return;if(error?.code==='23505'||(!error&&!data)){paused=true;queued=queued||payload;store(key()+':backup',JSON.parse(queued));display('Outra sessão alterou esta partida. Abra Minha conta para recarregar.');if(dialog.open)draw();return}if(error)throw error;rev=data.revision;display('Progresso salvo na nuvem.')}catch{if(run===epoch){queued=queued||payload;display('Sem sincronização: progresso preservado neste navegador.')}}finally{busy=false;if(queued&&!paused&&run===epoch){clearTimeout(timer);timer=setTimeout(flush,5000)}}}
+async function signOut(){await flush();if(queued&&!confirm('Há alterações não sincronizadas. Sair mesmo assim? O backup local será preservado.'))return;await client.auth.signOut()}
+function guest(){++epoch;clearTimeout(timer);queued=null;rev=null;paused=false;user=null;activeUid=null;api.setKey(api.guestKey);api.load(read(api.guestKey));display('Progresso local');if(dialog.open)draw()}
+async function reset(){if(!user||!confirm('Apagar permanentemente o progresso online desta conta?'))return;paused=true;clearTimeout(timer);queued=null;const id=user.id;try{const {error}=await client.from('game_saves').delete().eq('user_id',id);if(error)throw error;remove(key());remove(key()+':backup');rev=null;paused=false;api.load(null);display('Progresso apagado.');if(dialog.open)draw()}catch{paused=false;display('Não foi possível apagar a partida online.')}}
+async function init(opts){api=opts;account=$('cloudAccount');dialog=document.createElement('dialog');dialog.className='cloudpanel';const close=document.createElement('button');close.className='cloudclose';close.textContent='×';close.type='button';close.setAttribute('aria-label','Fechar');close.onclick=()=>dialog.close();const pane=document.createElement('div');pane.id='cloudContents';dialog.append(close,pane);document.body.append(dialog);account.onclick=open;display('Progresso local');if(!configured)return;try{if(!window.supabase){await new Promise((resolve,reject)=>{let sc=document.createElement('script');sc.src='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4/dist/umd/supabase.min.js';sc.onload=resolve;sc.onerror=reject;document.head.append(sc)})}client=window.supabase.createClient(cfg.url,cfg.anonKey,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});client.auth.onAuthStateChange((event,session)=>{setTimeout(()=>{if(session?.user){if(activeUid!==session.user.id)loadUser(session.user)}else if(activeUid)guest()},0)});const {data}=await client.auth.getSession();if(data?.session?.user&&activeUid!==data.session.user.id)loadUser(data.session.user);else if(!data?.session)display('Progresso local');window.addEventListener('online',flush);document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')flush()})}catch{display('Autenticação indisponível. Progresso local.')}}
+window.MundoAuth={init,notify,signedIn:()=>!!user,reset};
+})();
